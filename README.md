@@ -8,6 +8,8 @@ Source code for my Bilibili channel "有所思".
 
 这里就是我的[Bilibili主页](https://space.bilibili.com/155818570)！此外markdown版本的文字稿也会在我的[知乎账号](https://www.zhihu.com/people/xiao-huang-ggg-97)下同步连载，欢迎关注！
 
+![cover](./src/media/cover.jpeg)
+
 ## Citation
 
 ```bibtex
