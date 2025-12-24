@@ -169,8 +169,8 @@ $ <grpo-deduction>
 据此我们就得到了一个逐token计算的替代目标 $cal(J)^"token" (theta)$，它就是真实目标的一个一阶近似。我们不难计算出它与真实目标的偏差在 $O(delta^2)$ 量级，同时自身的方差也是 $O(|y| delta^2)$，显著小于真实目标 (随序列长度指数级增长)。但仔细考查这个目标函数我们会发现，它和GRPO原论文当中的计算结果并不相同，而当我们计算两者的导数并去除常数项之后就能看到更具体的差异所在
 
 $
-gradient_theta cal(J)_"GRPO" (theta) &= EE_(vb(x) tilde cal(D), vb(y) tilde mu_(theta_"old") (dot | vb(x))) [1/(|vb(y)|) sum_(t=1)^(|vb(y)|) (vb(y), vb(x)) A (vb(x), vb(y)) gradient_theta r_t (vb(y), vb(x))]\
-gradient_theta cal(J)_"token" (theta) &= EE_(vb(x) tilde cal(D), vb(y) tilde mu_(theta_"old") (dot | vb(x))) [sum_(t=1)^(|vb(y)|) (vb(y), vb(x)) A (vb(x), vb(y)) gradient_theta r_t (vb(y), vb(x))]
+gradient_theta cal(J)_"GRPO" (theta) &= EE_(vb(x) tilde cal(D), vb(y) tilde mu_(theta_"old") (dot | vb(x))) [1/(|vb(y)|) sum_(t=1)^(|vb(y)|) A (vb(x), vb(y)) gradient_theta r_t (vb(y), vb(x))]\
+gradient_theta cal(J)_"token" (theta) &= EE_(vb(x) tilde cal(D), vb(y) tilde mu_(theta_"old") (dot | vb(x))) [sum_(t=1)^(|vb(y)|) A (vb(x), vb(y)) gradient_theta r_t (vb(y), vb(x))]
 $
 
 也就是说两者差了一个长度归一化项 $1/(|vb(y)|)$，这在我们采样样本长度不同时将会切实地对梯度方向产生影响。那么究竟哪一个会是更好的近似目标呢？近期有很多研究都表明，后者能取得更好的性能表现，因为它才是理论上真正的一阶近似结果 @liu_understanding_2025 @zheng_stabilizing_2025。「删去长度归一化项」也正是Dr.GRPO算法当中所做的主要修正 @liu_understanding_2025。Dr.GRPO的论文当中更进一步地分析了这不符合理论的长度归一化项可能对训练造成的影响，指出它会造成错误的回复长度异常增加，而正确回复的长度异常下降，最终会造成大量的token浪费，并影响性能表现。
