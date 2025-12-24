@@ -1,0 +1,226 @@
+#import "@preview/may:0.1.1": *
+#show: may
+
+#set math.equation(numbering: "(1)")
+
+= 基础理论与算法解析
+
+>| 大语言模型时代的强化学习 - 1
+
+== 前言
+
+自从2022年InstructGPT这篇论文首次结合监督训练以及RLHF (Reinforcement Learning from Human Feedback) 方法开创大语言模型的后训练阶段，并随着ChatGPT发布取得空前成功之后 @ouyang_training_2022，对大语言模型的强化学习算法就取得了可观的关注度，并持续发展至今。如今对大语言模型的强化学习算法主体仍然继承自PPO @schulman_proximal_2017 等经典算法，但同时又有了许多新的改变。强化学习算法的上一轮高潮是在2025年初，DeepSeek依靠简洁的可验证强化学习 (Reinforcement Learning from Verifiable Reward, RLVR) 激发了大语言模型深度思考的潜力，其所带来的影响持续至今 @deepseek-ai_deepseek-r1_2025。
+
+我们尚未知晓大模型的下一轮变革会在何时到来，但强化学习 (Reinforcement Learning, RL) 仍将在其训练当中扮演着重要的角色。这是由它的训练方式决定的，不同于监督训练仅是拟合给定的文本，强化学习直接针对一个抽象的目标进行优化，也因此其训练效果就充满了想象空间。
+
+本子系列文章就希望从一个统一的理论框架出发，重新梳理与解析大语言模型时代的各种代表性强化学习算法，以及各种相关的技巧，期望能够为相关研究者提供帮助或启发。当然由于笔者水平有限，文中如有错漏之处还望各位帮助指正，本系列文章也会持续维护更新，以确保其内容质量与时效性。
+
+== 从一个简单的目标出发
+
+强化学习算法通常关注的是最大化一个特定的reward函数。对于任意一个输入 $vb(x)$ 和输出 $vb(y)$，我们可以定义对应的reward函数为 $R(vb(x), vb(y))$。注意在大语言模型当中，这里的输入和输出通常都是一个序列对象。我们将语言模型记作 $pi_theta$ (或者在强化学习术语当中它也常常被称作「策略」)，那么在自回归生成的工作模式下序列的似然就可以这样计算
+
+$ pi_theta (vb(y) | vb(x)) = product_(t = 1)^(|vb(y)|) pi_theta (y_t | vb(x), y_(< t)) $ <sequence-likelihood>
+
+在当前大语言模型的多数应用当中，reward函数都是在序列层级 (sequence-level) 给出的，此时我们的优化目标就变成了
+
+$ cal(J) (theta) = EE_(vb(x) tilde cal(D), vb(y) tilde pi_theta (dot | vb(x))) [R(vb(x), vb(y))] $ <rl_target>
+
+此处的 $cal(D)$ 就是数据集分布，$theta$ 表示大语言模型的参数，也就是我们的优化目标，这些都属于标准记号。注意上面这个目标函数当中，reward计算 $R(vb(x), vb(y))$ 本身是不依赖于模型参数的，而大模型的作用仅仅体现在输出 $vb(y)$ 的概率分布上。
+
+@rl_target 就是我们后续一切RL算法所期望优化的最终目标，当然在实现最大化reward的过程当中仍然存在种种困难，需要我们设计各类技巧加以解决。
+
+事实上在上式当中我们可以利用一些小技巧直接计算出 $cal(J) (theta)$ 对参数 $theta$ 的梯度，并以此结合各种梯度下降算法来进行优化。
+
+$
+gradient_theta cal(J) (theta) &= gradient_theta (EE_(x tilde cal(D)) [integral R(vb(x), vb(y)) pi_theta (vb(y) | vb(x)) dif vb(y)])\
+&= EE_(vb(x) tilde cal(D)) [integral R(vb(x), vb(y)) (gradient_theta pi_theta (vb(y) | vb(x))) dif vb(y)]\
+&= EE_(vb(x) tilde cal(D)) [integral R(vb(x), vb(y)) pi_theta (vb(y) | vb(x)) gradient_theta log pi_theta (vb(y) | vb(x)) dif vb(y)]\
+&= EE_(vb(x) tilde cal(D), vb(y) tilde pi_theta (dot | vb(x))) [R(vb(x), vb(y)) gradient_theta log pi_theta (vb(y) | vb(x))]
+$ <rf_grad>
+
+在此处第一步推导是将关于 $y tilde pi_theta (dot | vb(x))$ 的期望展开为积分方便计算。第二步推导时假设了各种积分和导数都可交换，这在应用学科当中都属于常规做法。而在第三步推导当中我们使用了一个关键的log derivative trick，其来源就是简单的链式求导法则
+
+$
+gradient_theta log pi_theta (vb(y) | vb(x)) = dv(, pi_theta) log pi_theta dot gradient_theta pi_theta (vb(y) | vb(x))
+= 1/(pi_theta (vb(y) | vb(x))) gradient_theta pi_theta (vb(y) | vb(x))
+$
+
+之后只需要简单变形代入回原式即可。由此最终我们就可以把目标函数的梯度也写作一个期望的形式，并进一步进行轨迹采样以及估计。这也就是经典的REINFORCE算法，其最终的目标函数就和带有reward加权的cross entropy loss几乎一致。
+
+但在此之后，由于很多实践上的限制，这种基础的REINFORCE算法仍然需要大量额外的改良才能满足实用需求。
+
+== 前置讨论 - 偏差与方差
+
+偏差 (bias) 与方差 (variance) 是统计学上进行数值估计的核心概念之一。在机器学习当中我们也时常遇到需要通过样本去估计某一个目标值的情况，例如通过随机采样去预估真实的目标函数，如同前文当中REINFORCE的目标函数就是一个期望的形式，它当然是无法直接计算的。不过在概率论当中我们有一个重要的结论：大数定律，它保证了上述期望形式的数值总可以通过采样平均去逼近。也就是说如果我们随机采样出了 ${(vb(x)_i, vb(y)_i)}_(i=1)^N$ 这些数据点，记 $cal(l)(vb(x)_i, vb(y)_i) = R(vb(x)_i, vb(y)_i) gradient_theta log pi_theta (vb(y)_i | vb(x)_i)$，那么就有
+
+$
+lim_(N->oo) 1/N sum_(i=1)^N cal(l)(vb(x)_i, vb(y)_i) = EE[cal(l)(vb(x), vb(y))] quad "a.s."
+$
+
+就能得到所需的目标函数。由于上述估计量的期望严格等于目标的目标函数，在大数律下会精确收敛到目标，这种估计量我们就称为无偏估计量。但在实践当中我们永远只能采样到有限的样本数量，许多情况下 $N$ 的数值可能很小，因此有限情形估计的精确度同样至关重要。这通常就是使用估计量的方差来进行衡量的，在很多应用当中有时我们也不得不在偏差和方差之间做出取舍，即使估计量不能精确收敛到目标值，也希望换取估计稳定。在这里概率论当中的另一个重要定理就发挥作用了，它就是中心极限定理。它确保了在通常情况下：
+
+$
+&lim_(N->oo) (sum_(i=1)^N cal(l)(vb(x)_i, vb(y)_i) - N EE[cal(l)(vb(x), vb(y))])/(sqrt(N "Var"(cal(l)(vb(x), vb(y))))) tilde cal(N)(0, 1)\
+&quad ==> "Var"(1/N sum_(i=1)^N cal(l)(vb(x)_i, vb(y)_i)) -> 1/N "Var"(cal(l)(vb(x), vb(y)))
+$
+
+也就是说随机采样时均值估计的方差会随着样本数量呈反比例下降，但是仍高度依赖于估计量自身的方差。如果原本估计值的方差尤其大的话，这种误差就很难通过增加样本量来消除了。取得小方差的稳定估计对于RL算法的稳定性至关重要。
+
+== 优势估计 (Advantage Estimation)
+
+注意到在此前我们推导的强化学习损失函数仍然是一个期望的形式，而在实际操作当中我们只能够去使用随机采样估计真实的平均reward上升的方向。在此前的推导当中可知直接使用 @rf_grad 最后的公式就可以进行估计并取得一个无偏的结果。
+
+而在前述公式当中对于估计方差并没有很好的保障，事实上它是可以在很大程度上得到优化的，优势估计就可以在保持估计无偏的情况下大幅减少目标函数估计的方差。我们不妨考虑一个针对数学解题进行可验证强化学习 (RLVR) 的简单情景，此时reward就是根据答案正误判断得到的分值，$x tilde cal(D)$ 就是从训练题库当中采样得到的命题。此时我们对于目标函数估计 $tilde(cal(J)) (theta)$ 的方差实际上来自两个方面:
+
+$
+&"Var"_(vb(x) tilde cal(D), vb(y) tilde pi_theta (dot | vb(x)))(tilde(cal(J)) (theta)) =\ &quad EE_(vb(x) tilde cal(D)) ["Var"_(vb(y) tilde pi_theta (dot | vb(x)))(R(vb(x), vb(y)))] + "Var"_(vb(x) tilde cal(D))(EE_(vb(y) tilde pi_theta (dot | vb(x))) [R(vb(x), vb(y))])
+$
+
+这个可以应用概率论当中的全方差公式得到，直观理解前一项方差来自于语言模型采样的随机性，后一项方差则来自于问题本身的随机性。此时如果我们可以通过某种方式估算出 $EE_(vb(y) tilde pi_theta (dot | vb(x))) [R(vb(x), vb(y))]$ 对每一个问题 $vb(x)$ 的具体数值的话，就可以将这一项从目标函数当中减去，并取得一个更准确的估计值以稳定训练。目标函数当中减去一个仅依赖于 $vb(x)$ 的变量也并不会影响到训练方向。也就是说引入优势函数 $A(vb(x), vb(y)) = R(vb(x), vb(y)) - EE_(y tilde pi_theta (dot | vb(x))) [R(vb(x), vb(y))]$ 之后我们的目标函数就可以改写为：
+
+$ cal(J) (theta) = EE_(vb(x) tilde cal(D), vb(y) tilde pi_theta (dot | vb(x))) [A(vb(x), vb(y))] $
+
+此时全方差公式当中的第二项就会自然消失。
+
+在经典的PPO算法当中这个估计是通过训练额外的value model，并配合一套相对复杂的广义优势估计算法来实现的@schulman_proximal_2017。在PPO时代经典的RL设定当中普遍预设存在稠密reward，即进行一步动作或生成token后都会取得新的反馈，这就会使得优势计算变得很复杂。而在大语言模型时代常见的RLVR等设定下，我们只有在最终的序列层级有一个单一的反馈，如此就可以极大地简化优势估计的过程。当前常用的GRPO等算法当中通常就直接使用简单的群组归一化来实现这一点@shao_deepseekmath_2024，其具体计算公式就是
+
+$
+A (vb(y)_i, vb(x)) = (R(vb(x), vb(y)_i) - "mean"(R(vb(x), vb(y))))/("std"(R(vb(x), vb(y))) + epsilon)
+$ <grpo_adv_est>
+
+这里的 $vb(y)_i$ 就是针对同一个问题 $vb(x)$ 采样得到的多个不同推理轨迹，$epsilon$ 就是一个防止除零的小量。值得注意的是，按照我们此前的推理，正确的优势估计方法理应是
+
+$ A (vb(y)_i, vb(x)) = R(vb(x), vb(y)_i) - "mean"(R(vb(x), vb(y))) $
+
+而不涉及除以标准差的归一化。在DeepSeek最早提出算法时也并没有对这一归一化的作用做出解释。事实上在最近的一些研究当中确实表明，我们的推导是正确的，而原GRPO当中的归一化操作就可能引入额外的偏差，并不利于RL训练 @liu_understanding_2025。
+
+== 重要性采样 (Importance Sampling)
+
+在针对大模型的大规模强化学习训练当中普遍存在着一定的离策略 (off-policy) 性质，也即采样轨迹服从的分布和期望训练的模型分布并不相同 (反之训推一致的情形则称为on-policy)。事实上这一问题早在大模型时代之前就已经被普遍关注了，而现今这种off-policy性质的来源主要有以下两类：@zheng_stabilizing_2025
+
+/ 训推差异 (training-inference discrepancy): 在很多时候为了加速采样以及提升RL算法的效率，轨迹采样通常在专门的推理引擎 (如SGLang和vLLM) 当中进行，而梯度回传和参数更新则在训练引擎 (如FSDP和Megatron) 当中进行。但是由于量化精度、计算方式差异等等复杂的工程原因，同一个模型在训练和推理引擎当中计算出的结果始终是存在差异的，而这种差异甚至可以非常大。
+/ 策略偏移 (policy staleness): 随着训练的进行，我们训练引擎当中的模型参数会不断更新并持续偏离旧策略。但训练当中我们所使用的数据仍然采样自旧参数，这就会造成一定的分布差异。与此同时如果频繁同步各模块模型参数的话将会非常影响训练效率，因此需要容许一定的策略偏移存在。
+
+在这一背景之下，如果我们期望使用off-policy数据来进行训练的话，就需要对训练目标做一定的概率修正才能确保训练方向无偏 (即不偏离最大化reward这一目标)。这种技术就被称作「重要性采样」。注意即使是参数统一的on-policy训练情形，由于训练和推理引擎造成的训推差异也同样始终存在。
+
+我们将训练引擎当中的语言模型仍记作 $pi_theta$，同时将推理引擎当中的策略记作 $mu_(theta_"old")$，那么通过一些简单的计算可以发现
+
+$
+cal(J) (theta) = EE_(vb(x) tilde cal(D), vb(y) tilde pi_theta (dot | vb(x))) [A(vb(x), vb(y))] = EE_(vb(x) tilde cal(D), vb(y) tilde mu_(theta_"old") (dot | vb(x))) [(pi_theta (vb(y) | vb(x)))/(mu_(theta_"old") (vb(y) | vb(x))) A(vb(x), vb(y))]
+$
+
+此处 $(pi_theta (vb(y) | vb(x)))/(mu_(theta_"old") (vb(y) | vb(x)))$ 就被称作重要性权重 (importance ratio)，我们将其简记作 $r(vb(y), vb(x))$，同时将逐token的重要性权重记作 $(pi_theta (y_t | vb(x), y_(<t)))/(mu_(theta_"old") (y_t | vb(x), y_(<t))) = r_t (vb(y), vb(x))$。此时我们不难看出在自回归生成的工作模式下这两类重要性权重之间的关系如下：
+
+$ r(vb(y), vb(x)) = product_(t=1)^(|y|) r_t (vb(y) | vb(x), vb(y)) $
+
+它的作用就相当于是对采样轨迹做了重新加权。事实上如果我们将目标函数第二层的期望展开成积分式的话这个推导就很显然了:
+
+$
+cal(J) (theta) &= EE_(vb(x) tilde cal(D)) [integral A(vb(x), vb(y)) (pi_theta (vb(y) | vb(x)))/(mu_(theta_"old") (vb(y) | vb(x))) mu_(theta_"old") (vb(y) | vb(x)) dif vb(y)]\
+&= EE_(vb(x) tilde cal(D)) [integral A(vb(x), vb(y)) pi_theta (vb(y) | vb(x)) dif vb(y)] = EE_(vb(x) tilde cal(D), vb(y) tilde pi_theta (dot | vb(x))) [A(vb(x), vb(y))]
+$
+
+而它对于 $theta$ 求梯度的结果也可以类似的计算，由于 $theta_"old"$ 不参与梯度计算，所以推导过程都是一致的。最终我们可以得到：
+
+$
+gradient_theta cal(J) (theta) = EE_(vb(x) tilde cal(D), vb(y) tilde mu_(theta_"old") (dot | vb(x))) [r(vb(y), vb(x)) A(vb(x), vb(y)) gradient_theta log pi_theta (vb(y) | vb(x))]
+$
+
+重要性采样充分考虑到了off-policy训练所造成的影响，并为「最大化reward」这一目标提供了理论保证。这也是RL算法在训练效果以及泛化能力上胜过监督训练 + 数据筛选的关键所在 @chen_retaining_2025。而另一方面，如果完全不进行重要性采样这一数学修正的话，即使纯on-policy的训练过程也会迅速崩溃 @zheng_stabilizing_2025。
+
+到此时我们已经从形式上找到了off-policy情形强化学习的真实目标函数，但其实真正的麻烦才刚刚开始。因为在上述估计当中 $r(vb(y), vb(x))$ 这一项实际是多个似然比的乘积，而在深度思考的时代我们的生成序列长度往往都在数千上万。即使其中的每一项 $r_t (vb(y), vb(x))$ 都接近于1，累乘之后也必然会产生严重的数值问题，或爆炸或消失。直接对上面的目标函数进行优化几乎没有可行性，而当前对大模型的RL算法研究的重点就在于寻找稳定与高效的替代方案上，即使它可能导致训练的方向部分偏离「最大化reward」这一初衷。
+
+== 从PPO到GRPO
+
+在详细讲述现代各种强化学习算法对上述真实目标函数的处理之前，我们需要先偏到历史线来讲解各个知名算法的发展脉络。事实上很多算法在刚刚提出时都还没有完善的理论基础，而后来的我们也可以从理论上分析这些算法的性质并找到优化方向。在此处我们主要讲两个代表性算法，近端策略优化 (Proximal Policy Optimization, PPO) @schulman_proximal_2017 和群组相对策略优化 (Group Relative Policy Optimization) @shao_deepseekmath_2024，可以说两者分别代表了RLHF和RLVR两个时代。
+
+PPO算法最早提出于2017年，当此之时人们仍普遍假设每一步动作当中都有稠密的优势函数，由此每一个token (或者广义而言，每一个动作) 都可以独立地使用重要性采样以及更新。那么在我们的记号下它的损失函数就可以被写作
+
+$
+cal(J)_"PPO" (theta) = EE_(vb(x) tilde cal(D), vb(y) tilde mu_(theta_"old") (dot | vb(x))) [1/(|vb(y)|) sum_(t=1)^(|vb(y)|) r_t (vb(y), vb(x)) A_t (vb(x), vb(y))]
+$
+
+注意在这里逐token独立更新的情形下就不存在重要性权重的数值问题了，不过为了训练稳定性考虑，实际PPO算法当中还使用了似然比截断和KL散度约束等方案。为行文顺畅我们暂且略过这些算法当中所使用的各类正则化方法，留待后续连载当中讨论。后来在DeepSeekMath @shao_deepseekmath_2024 这项工作当中DeepSeek首次提出了GRPO算法，此时的GRPO主要在PPO的基础上对优势估计的部分做出了简化，不再依靠value model而是直接使用群组均值计算优势，如 @grpo_adv_est 当中所示。除此之外其目标函数主项就和PPO大致相同：
+
+$
+cal(J)_"GRPO" (theta) = EE_(vb(x) tilde cal(D), vb(y) tilde mu_(theta_"old") (dot | vb(x))) [1/(|vb(y)|) sum_(t=1)^(|vb(y)|) r_t (vb(y), vb(x)) A (vb(x), vb(y))]
+$
+
+在这里我们同样略去了原论文当中的群组记号和正则化项，看起来会更简洁一些。但此时，在很多应用场景当中我们的reward和优势函数估计都是在序列层级进行的，GRPO目标函数的构造当中实际上默认了序列的优势等价于每一个token都具有同样多的优势，但是这一假设是否合理呢？另一方面我们在前述的推导当中实际上得到了序列层级的真实优化目标，它和GRPO的目标函数之间形式上并不相同，那么它们之间又有什么关联呢？此前已有不少的研究者关注到了这一问题，并在理论和实验多方面给出了解答 @zheng_group_2025 @liu_understanding_2025 @zheng_stabilizing_2025。
+
+== 一阶近似的理论解析
+
+在近期阿里的一篇论文当中提出，GRPO形式的目标函数实际上可以被视作真实目标的某种一阶近似 @zheng_stabilizing_2025。在此我们也顺着他们的思路继续推导一些相关的结果。
+
+首先我们知道在重要性权重计算当中的新旧策略虽有不同但出自同一个语言模型，其off-policy误差量级应当较小，如此我们就可以写出
+
+$
+(pi_theta (vb(y) | vb(x)))/(mu_(theta_"old") (vb(y) | vb(x))) = product_(t=1)^(|vb(y)|) (1 + delta_t) approx 1 + sum_(t=1)^(|y|) delta_t + O(delta^2) approx 1 + sum_(t=1)^(|y|) delta_t
+$
+
+据此在似然比误差 $delta_t$ 绝对值较小时我们就可以得到
+
+$
+cal(J) (theta) &= EE_(vb(x) tilde cal(D), vb(y) tilde mu_(theta_"old") (dot | vb(x))) [A(vb(x), vb(y)) (pi_theta (vb(y) | vb(x)))/(mu_(theta_"old") (vb(y) | vb(x)))]\
+&approx EE_(vb(x) tilde cal(D), vb(y) tilde mu_(theta_"old") (dot | vb(x))) [A(vb(x), vb(y)) (1 + sum_(t=1)^(|y|)((pi_theta (y_t | vb(x), y_(<t)))/(mu_(theta_"old") (y_t | vb(x), y_(<t))) - 1))]\
+&= cal(J)_"token" (theta)
+$ <grpo-deduction>
+
+据此我们就得到了一个逐token计算的替代目标 $cal(J)^"token" (theta)$，它就是真实目标的一个一阶近似。我们不难计算出它与真实目标的偏差在 $O(delta^2)$ 量级，同时自身的方差也是 $O(|y| delta^2)$，显著小于真实目标 (随序列长度指数级增长)。但仔细考查这个目标函数我们会发现，它和GRPO原论文当中的计算结果并不相同，而当我们计算两者的导数并去除常数项之后就能看到更具体的差异所在
+
+$
+gradient_theta cal(J)_"GRPO" (theta) &= EE_(vb(x) tilde cal(D), vb(y) tilde mu_(theta_"old") (dot | vb(x))) [1/(|vb(y)|) sum_(t=1)^(|vb(y)|) (vb(y), vb(x)) A (vb(x), vb(y)) gradient_theta r_t (vb(y), vb(x))]\
+gradient_theta cal(J)_"token" (theta) &= EE_(vb(x) tilde cal(D), vb(y) tilde mu_(theta_"old") (dot | vb(x))) [sum_(t=1)^(|vb(y)|) (vb(y), vb(x)) A (vb(x), vb(y)) gradient_theta r_t (vb(y), vb(x))]
+$
+
+也就是说两者差了一个长度归一化项 $1/(|vb(y)|)$，这在我们采样样本长度不同时将会切实地对梯度方向产生影响。那么究竟哪一个会是更好的近似目标呢？近期有很多研究都表明，后者能取得更好的性能表现，因为它才是理论上真正的一阶近似结果 @liu_understanding_2025 @zheng_stabilizing_2025。「删去长度归一化项」也正是Dr.GRPO算法当中所做的主要修正 @liu_understanding_2025。Dr.GRPO的论文当中更进一步地分析了这不符合理论的长度归一化项可能对训练造成的影响，指出它会造成错误的回复长度异常增加，而正确回复的长度异常下降，最终会造成大量的token浪费，并影响性能表现。
+
+此外值得指出的一点是，在最新的DeepSeek-V3.2的技术报告当中，DeepSeek本身也对GRPO算法做出了许多改良，但这些改良主要集中在正则化方法优化以及一些工程麻烦上，其中给出的GRPO算法公式仍然带有长度归一化项。暂时我们也尚不清楚DeepSeek是否有意识到GRPO算法当中存在的这一问题，不过在技术报告最后有指出DeepSeek-V3.2在解决问题时消耗的token数量比同期闭源的sota模型都要显著更多，其中可能就有一部分源于GRPO算法偏差的影响。
+
+当我们接受将GRPO算法视作真实目标的一种近似方法后，很多问题都会变得清晰明了起来。与此同时我们知道，对真实重要性权重的近似方法肯定不只一种，而我们或许就有办法使用概率或统计的方法去分析它们的性质。此处另一个值得关注的例子是阿里的群组序列策略优化 (Group Sequence Policy Optimization) 算法 @zheng_group_2025，它也是目前阿里内部训练大模型所使用的主力算法 (据小道消息)。GSPO算法的目标函数是：
+
+$
+cal(J)_"GSPO" (theta) = EE_(vb(x) tilde cal(D), vb(y) tilde mu_(theta_"old") (dot | vb(x))) [(r(vb(y), vb(x)))^(1/(|vb(y)|)) A (vb(x), vb(y))]
+$
+
+它相当于直接将token层级的重要性权重取几何均值作为真实重要性权重的替代，并应用在优化算法上。当然在实际计算时为数值稳定考虑理应是先取对数求和，平均后再取指数得到结果的。几何均值比起GRPO的算术求和而言能够更好地平滑极端值，因此具有更好的稳定性，这在MoE等类型的模型的训练当中可能相当重要。从阿里的实验看来GSPO算法的稳定性确实显著好于GRPO @zheng_group_2025。
+
+而同样使用数学方法分析不难发现，实际上GSPO同样也是真实目标的一个一阶近似，甚至同样也是有偏的。这是因为当 $delta_t$ 均较小时我们总有
+
+$
+(product_(t=1)^(|vb(y)|) (1 + delta_t))^(1/(|vb(y)|)) approx 1/(|vb(y)|) sum_(t=1)^(|vb(y)|) (1 + delta_t)
+$
+
+几何均值当中也隐式地包含了长度归一化项，因此要达到理论上正确的一阶近似结果，我们的目标函数就应当修正为
+
+$
+cal(J)_"Dr.GSPO" (theta) = EE_(vb(x) tilde cal(D), vb(y) tilde mu_(theta_"old") (dot | vb(x))) [ |vb(y)| (r(vb(y), vb(x)))^(1/(|vb(y)|)) A (vb(x), vb(y))]
+$
+
+应当额外乘上一项序列长度。同样值得指出的是，在阿里新近发表的论文，如SAPO当中，他们似乎也没有关注到这一问题，其中的各类算法其实都存在这种偏置 @gao_soft_2025。不过在一些知名的强化学习框架，如#link("https://github.com/inclusionAI/AReaL", "AReaL")当中，他们就明确指出了这个问题的存在并给予了修正。
+
+那么同样作为一阶近似，GRPO和GSPO在表现上理应是比较接近的，不过我们同样可以计算分析出一些细节上的差异。注意这里的讨论都针对修正后的Dr.GRPO和Dr.GSPO进行，并且需要引入一些额外假设。
+
+- 一阶几何近似 $s_1$ (Dr.GSPO):
+  - 误差 $t (vb(x), vb(y)) - s_1 (vb(x), vb(y)) approx Sigma_2 + 1/2 sum_(t=1)^N delta_t^2$
+  - 估计方差 $"Var"(s_1) approx N^2 "Var"(1/N sum_(t=1)^N log(1 + delta_t)) < N sigma^2$
+  - (注：由于 $delta_t$ 来自于概率比值，其均值为正，加上几何平均有更好的平滑极值的能力，因此估计方差这里应当小于一阶近似)
+- 一阶近似 $g_1$ (Dr.GRPO):
+  - 误差 $t (vb(x), vb(y)) - g_1 (vb(x), vb(y)) approx Sigma_2$
+  - 估计方差 $"Var"(g_1) = "Var"(1 + Sigma_1) = sum_(t=1)^N "Var"(delta_t) = N sigma^2$
+
+具体的计算过程可以给读者留作习题。实际上我们可以看出GSPO相比GRPO而言方差更小而误差更大，换言之就是训练会更加稳定但是最终的性能上限会略低，这一点在我们自己的实验和阿里一些较新的研究当中都能得到一些印证 @gao_soft_2025。
+
+除此之外沿着同样的思路我们还可以依靠 $r(vb(y), vb(x))$ 的不同近似方法构造出很多其他的算法，不过它们大多也只能做到在性能和稳定性 (可能可以分别对应到误差和方差) 之间做取舍，并不能够取得显著优于现有算法的表现，在此仅稍作提及。
+
+== 后记
+
+在本章节当中我们整体按照 @zheng_stabilizing_2025 当中的思路给出了大语言模型时代的强化学习算法的理论框架，推导并初步分析了GRPO和GSPO两个代表性优化算法的性质。当然本系列文章才刚刚开始，还有非常多RL算法当中的细节没有提及，例如正则化方法、Agentic RL、RL infra等等等等，可讲的东西还非常多，有待后续更新连载。
+
+事实上在当前大语言模型的工程实践当中还存在很多混乱与麻烦的事情，例如同样在知名的RL框架#link("https://github.com/inclusionAI/AReaL", "AReaL")当中，其对GRPO、Dr.GRPO、GSPO三个算法的实现都和原论文甚至其自身所提供的文档当中并不相同，并且可能对训练结果产生明显的影响。例如在笔者撰稿时最新的AReaL v0.5.0 版本当中，它的GRPO实际上删去了关键的长度归一化项，本质上是Dr.GRPO的一个变体。而其中的Dr.GRPO算法与GRPO仅有一个参数上的差别。AReaL版本的GSPO则额外实现了长度偏差的修正。与此同时这三个算法都额外加入了原公式当中并没有的Batch层级的归一化，当然它对于训练本身影响不大。在训练框架当中使用这些算法时应当尤其注意，即使名称相同，它们也已经与论文当中所见的版本存在相当大的差异了。
+
+AReaL当中另一个麻烦的地方在于，它实际上仅使用这些算法去修正了策略偏移 (policy staleness) 所产生的差异，而其中对于另一项训推差异 (training-inference discrepancy) 的处理方式则没有遵从上述任何一种算法并且也没有在公式或文档当中明确表达出来 (这种处理可能也是继承自前大模型时代的一般做法，只是没有太多人关注)。读者如有兴趣可以去自行研究一下AReaL当中目标函数计算相关的代码。
+
+上述这些其实并不是AReaL的问题，它实际上是非常高质量的RL训练框架，在此前我也花费了不少时间去研究其代码实现，并且与开发者有过交流。AReaL当中这些算法的实现多数情况下都是比原算法更优的版本，其实也不必强求他们和原算法保持一致。工程实践当中原本就充斥着大量麻烦的事情，不过所幸我们仍可以在同一个理论框架下讨论与分析各类算法的特性，研究改进方向等等，而不至于在大量繁杂的工程实践当中迷失。这也许就是寻找AI数学理论的部分意义所在。
+
+#bibliography("有所思.bib", style: "ieee")
